@@ -122,3 +122,30 @@ awk_cmd() {
   done
   echo 'awk -W interactive'
 }
+
+# The hub binary, built from src when it is missing or older, or nothing when there is no compiler
+hub_bin() {
+  local root bin
+  root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+  bin="$root/bin/osc7577"
+  if [[ ! -x $bin || $root/src/osc7577.c -nt $bin ]]; then
+    command -v cc >/dev/null || return 1
+    mkdir -p "$root/bin"
+    cc -O2 -w -o "$bin.new" "$root/src/osc7577.c" 2>/dev/null && mv -f "$bin.new" "$bin" || return 1
+  fi
+  printf '%s' "$bin"
+}
+
+# A Unix socket path has to stay under about 100 bytes, so the hub's socket lives where tmux keeps its own
+hub_sock() {
+  local d="${TMUX_TMPDIR:-/tmp}/tmux-osc7577-$EUID"
+  (umask 077 && mkdir -p "$d")
+  if [[ -L $d || ! -O $d || -z $(find "$d" -maxdepth 0 -perm 0700) ]]; then
+    return 1
+  fi
+  printf '%s/%s.sock' "$d" "$(tmux display -p '#{pid}')"
+}
+
+hub_alive() {
+  [[ -S $1 ]] && kill -0 "$(cat "$1.pid" 2>/dev/null)" 2>/dev/null
+}

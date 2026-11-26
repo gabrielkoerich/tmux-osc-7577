@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs after tmux creates a pane: notes the token tmux copied into it from the global environment, sets a fresh
-# one for the next pane, and starts the pane's reader. tmux has no hook for respawn-pane, so those keep the old
+# one for the next pane, and pipes the pane's output to the reader. tmux has no hook for respawn-pane
 set -u
 dir=$(cd "$(dirname "$0")" && pwd)
 source "$dir/lib.sh"
@@ -12,7 +12,7 @@ fi
 
 srv=$(server_dir)
 file="$srv/tokens/${pane#%}"
-# A pane that has a token is not new, as when a grouped session reuses it, so only its reader is checked
+# A pane that has a token is not new, as when a grouped session reuses it, so only its pipe is checked
 if [[ ! -e $file ]]; then
   lock="$srv/tokens/.lock"
   for _ in $(seq 50); do
@@ -32,7 +32,24 @@ if [[ ! -e $file ]]; then
   rmdir "$lock" 2>/dev/null
 fi
 
-if [[ -s $file ]]; then
-  # tmux expands % in this command like strftime, so the pane goes as its number
+if [[ ! -s $file ]]; then
+  exit 0
+fi
+
+# tmux expands % in a pipe-pane command like strftime, so the pane goes as its number
+# @osc7577-reader picks the reader: auto, the hub where it builds, or awk, one process a pane
+reader=$(option @osc7577-reader auto)
+if [[ $reader != awk ]] && bin=$(hub_bin) && sock=$(hub_sock) && [[ $bin != *\'* && $sock != *\'* ]]; then
+  if ! hub_alive "$sock"; then
+    tmux run-shell -b "'$bin' hub '$sock' '$(tmux display -p '#{pid}')' '$dir/accept' >/dev/null 2>&1"
+    # A hub that died closed every pane's pipe, so the panes that have a token get theirs back
+    for p in $(tmux list-panes -a -F '#{pane_id}#{?pane_pipe,,-}' | grep -- '-$' | tr -d -); do
+      if [[ $p != "$pane" && -s $srv/tokens/${p#%} ]]; then
+        tmux pipe-pane -o -O -t "$p" "exec '$bin' pass '$sock' '${p#%}'"
+      fi
+    done
+  fi
+  tmux pipe-pane -o -O -t "$pane" "exec '$bin' pass '$sock' '${pane#%}'"
+else
   tmux pipe-pane -o -O -t "$pane" "LC_ALL=C exec $(awk_cmd) -v 'RS=[\n\033\007]' -v pane='${pane#%}' -v accept='$dir/accept' -f '$dir/scan.awk'"
 fi

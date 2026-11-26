@@ -31,6 +31,7 @@ tmux_real() {
 start() {
   tmux_real -S "$sock" -f /dev/null new -d -s main -x 120 -y 40 "bash --norc --noprofile"
   tmux_real -S "$sock" set -g @resurrect-hook-post-save-all ''
+  tmux_real -S "$sock" set -g @osc7577-reader "${READER:-auto}"
   "$root/osc-7577.tmux"
 }
 
@@ -198,4 +199,23 @@ records() {
   type_in "$p" "cat $BATS_TEST_TMPDIR/out/flood; echo done >$BATS_TEST_TMPDIR/out/flooded"
   wait_for file "$BATS_TEST_TMPDIR/out/flooded"
   [ $(( $(date +%s) - start )) -lt 4 ]
+}
+
+@test "with the hub, panes have no process of their own, and a new pane brings a killed hub back" {
+  [ "${READER:-auto}" = auto ] || skip "the hub is not the reader"
+  a=$(pane) b=$(pane)
+  srv=$(tmux_real -S "$sock" display -p '#{pid}')
+  hub=$(cat "${TMUX_TMPDIR:-/tmp}/tmux-osc7577-$EUID/$srv.sock.pid")
+  kill -0 "$hub"
+  [ "$(pgrep -f 'osc7577 pass' | wc -l | tr -d ' ')" -eq 0 ]
+  ! pgrep -f "$root/scripts/scan.awk"
+  kill "$hub"
+  type_in "$a" true
+  type_in "$b" true
+  sleep 0.5
+  c=$(pane)
+  sleep 0.5
+  [ "$(tmux_real -S "$sock" display -p -t "$a" '#{pane_pipe}')" = 1 ]
+  type_in "$a" "'$root/scripts/report' -- probe"
+  wait_for record "${a#%}"
 }
