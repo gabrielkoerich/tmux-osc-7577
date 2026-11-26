@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# tmux-resurrect's save and restore hooks. Save keeps the best live record of each pane, restore types a fixed
+# command into each recreated shell pane, and run then starts the recorded argv there
+set -u
+dir=$(cd "$(dirname "$0")" && pwd)
+source "$dir/lib.sh"
+
+# One saved set for each tmux socket, so two servers never restore each other's programs
+resume_dir() {
+  printf '%s/resume-%s' "$(state_dir)" "$(tmux display -p '#{socket_path}' | sha256 | cut -c1-12)"
+}
+
+save() {
+  local srv out tmp n=0 pane sess widx pidx f best depth bdepth pid
+  srv=$(server_dir)
+  out=$(resume_dir)
+  tmp=$(mktemp -d "$(state_dir)/.resume.XXXXXX") || return 0
+  while IFS=$sep read -r pane sess widx pidx; do
+    best='' bdepth=''
+    for f in "$srv/records/${pane#%}".*; do
+      if [[ ! -f $f ]]; then
+        continue
+      fi
+
+      # A record goes with its program, once the pid is gone or belongs to a new process
+      pid=${f##*.}
+      if [[ $(sed -n 2p "$f") != "$(started "$pid")" ]]; then
+        rm -f "$f"
+        continue
+      fi
+
+      depth=$(sed -n 3p "$f")
+      if [[ -z $bdepth ]] || (( depth < bdepth )); then
+        best=$f bdepth=$depth
+      fi
+    done
+
+    if [[ -n $best ]]; then
+      n=$(( n + 1 ))
+      { printf '%s\n' "$sess$sep$widx$sep$pidx"; tail -n +4 "$best"; } >"$tmp/$n"
+    fi
+  done < <(tmux list-panes -a -F "#{pane_id}$sep#{session_name}$sep#{window_index}$sep#{pane_index}")
+
+  rm -rf "$out.old"
+  if [[ -d $out ]]; then
+    mv "$out" "$out.old"
+  fi
+  mv "$tmp" "$out"
+  rm -rf "$out.old"
+  prune "$srv"
+}
+
+# Tokens and records of closed panes, and the folders of servers that are gone
+prune() {
+  local srv=$1 live f d pid
+  live=" $(tmux list-panes -a -F '#{pane_id}' | tr -d '%' | tr '\n' ' ') "
+  for f in "$srv"/tokens/* "$srv"/records/*; do
+    if [[ -f $f ]]; then
+      f=${f##*/}
+      if [[ $live != *" ${f%%.*} "* ]]; then
+        rm -f "$srv/tokens/$f" "$srv/records/$f"
+      fi
+    fi
+  done
+
+  for d in "$(state_dir)"/server-*; do
+    pid=${d##*/server-}
+    pid=${pid%%-*}
+    if [[ -d $d && $d != "$srv" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$d"
+    fi
+  done
+}
+
+restore() {
+  local src run allow shells f sess widx pidx pane argv0 n=0
+  src=$(resume_dir)
+  if [[ ! -d $src || $dir == *\'* ]]; then
+    return 0
+  fi
+
+  run="$(state_dir)/run"
+  (umask 077 && mkdir -p "$run")
+  allow=" $(option @osc7577-allow '') "
+  shells=" $(option @osc7577-shells 'zsh bash fish sh dash ksh tcsh nu') "
+  for f in "$src"/*; do
+    if [[ ! -f $f ]]; then
+      continue
+    fi
+
+    IFS=$sep read -r sess widx pidx <"$f"
+    pane="=$sess:$widx.$pidx"
+    if [[ $shells != *" $(tmux display -p -t "$pane" '#{pane_current_command}' 2>/dev/null) "* ]]; then
+      continue
+    fi
+
+    argv0=$(decode "$(sed -n 3p "$f")") || continue
+    if [[ $allow != '  ' && $allow != *" ${argv0##*/} "* ]]; then
+      continue
+    fi
+
+    n=$(( n + 1 ))
+    tail -n +2 "$f" >"$run/$n"
+    # The leading space keeps it out of the history of a shell that skips such lines
+    tmux send-keys -t "$pane" -l " '$dir/run' '$run/$n'" \; send-keys -t "$pane" Enter
+  done
+}
+
+case ${1:-} in
+  (save) save ;;
+  (restore) restore ;;
+  (*) echo "usage: resume save|restore" >&2; exit 2 ;;
+esac

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Sends an OSC 7577 report for a program: report [-p pid] [-C dir] -- argv..., or report [-p pid] --clear.
+# The owner is the caller by default. Without OSC7577_TOKEN the terminal has no resume, so nothing is sent
+set -u
+source "$(dirname "$0")/lib.sh"
+
+pid=$PPID cwd='' clear=''
+while (( $# )); do
+  case $1 in
+    (-p) pid=$2; shift 2 ;;
+    (-C) cwd=$2; shift 2 ;;
+    (--clear) clear=1; shift ;;
+    (--) shift; break ;;
+    (*) break ;;
+  esac
+done
+
+if [[ -z ${OSC7577_TOKEN:-} ]]; then
+  exit 0
+fi
+
+body="pid=$pid:time=$(date +%s)"
+if [[ -n $clear ]]; then
+  body+=":clear=1"
+else
+  if (( $# == 0 )); then
+    echo "usage: report [-p pid] [-C dir] -- argv... | report [-p pid] --clear" >&2
+    exit 2
+  fi
+
+  argv=
+  for a in "$@"; do
+    argv+="${argv:+,}$(printf '%s' "$a" | base64 | tr -d '\n')"
+  done
+  body+=":argv=$argv"
+  if [[ -n $cwd ]]; then
+    body+=":cwd=$(printf '%s' "$cwd" | base64 | tr -d '\n')"
+  fi
+fi
+
+mac=$(printf '%s:%s' "$body" "$OSC7577_TOKEN" | sha256)
+out=/dev/tty
+if ! { : >/dev/tty; } 2>/dev/null; then
+  out=/dev/stdout
+fi
+printf '\033]7577;%s:mac=%s\033\134' "$body" "$mac" >"$out"

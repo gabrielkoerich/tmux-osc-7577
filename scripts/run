@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Starts a restored command in the pane's shell, with each argv element as one argument and no shell parsing
+set -u
+source "$(dirname "$0")/lib.sh"
+
+f=${1:-}
+if [[ ! -f $f ]]; then
+  exit 1
+fi
+
+cwd=$(sed -n 1p "$f")
+argv=()
+while IFS= read -r e; do
+  v=$(decode "$e") || exit 1
+  argv+=("$v")
+done < <(tail -n +2 "$f")
+rm -f "$f"
+
+if [[ -n $cwd ]]; then
+  cd "$(decode "$cwd")" 2>/dev/null || true
+fi
+exec "${argv[@]}"

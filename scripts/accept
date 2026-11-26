@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Checks one OSC 7577 report from a pane the way the spec orders it, and keeps or clears that program's record
+set -u
+source "$(dirname "$0")/lib.sh"
+
+pane=$1 body=$2
+if [[ ! $pane =~ ^%[0-9]+$ || $body == '?' ]]; then
+  exit 0
+fi
+
+# Running as root needs an explicit opt in, a resumed command would run as root too
+if (( EUID == 0 )) && [[ $(option @osc7577-root off) != on ]]; then
+  exit 0
+fi
+
+srv=$(server_dir)
+token=$(cat "$srv/tokens/${pane#%}" 2>/dev/null)
+if [[ -z $token || ! $body =~ ^(.+):mac=([0-9a-f]{64})$ ]]; then
+  exit 0
+fi
+
+signed=${BASH_REMATCH[1]} mac=${BASH_REMATCH[2]}
+if [[ $(printf '%s:%s' "$signed" "$token" | sha256) != "$mac" ]]; then
+  exit 0
+fi
+
+# The time check also comes before any rule that could clear a record
+IFS=: read -ra pairs <<<"$signed"
+time='' pid=''
+for p in "${pairs[@]}"; do
+  if [[ $p == time=* ]]; then
+    time=${p#time=}
+  elif [[ $p =~ ^pid=([1-9][0-9]{0,9})$ ]]; then
+    pid=${BASH_REMATCH[1]}
+  fi
+done
+
+now=$(date +%s)
+if [[ ! $time =~ ^[1-9][0-9]{0,11}$ ]] || (( time < now - 60 || time > now + 60 )); then
+  exit 0
+fi
+
+# From here the report is genuine, so a broken rule means the program's command changed and its record goes
+reject() {
+  if [[ -n $pid ]]; then
+    rm -f "$srv/records/${pane#%}.$pid"
+  fi
+  exit 0
+}
+
+# read drops an empty last field, so an empty pair is caught here
+if [[ $signed == :* || $signed == *: || $signed == *::* ]]; then
+  reject
+fi
+
+seen=' ' argv='' cwd='' clear='' need=''
+for p in "${pairs[@]}"; do
+  if [[ ! $p =~ ^([a-z]+)=([A-Za-z0-9_.,+/=-]*)$ ]]; then
+    reject
+  fi
+
+  k=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+  if [[ $seen == *" $k "* || $k == mac ]]; then
+    reject
+  fi
+
+  seen+="$k "
+  case $k in
+    (pid)
+      if [[ ! $v =~ ^[1-9][0-9]{0,9}$ ]]; then
+        reject
+      fi
+      ;;
+    (argv) argv=$v ;;
+    (cwd) cwd=$v ;;
+    (clear) clear=$v ;;
+    (need) need=$v ;;
+  esac
+done
+
+if [[ -z $pid || $seen != *" time "* ]]; then
+  reject
+fi
+
+if [[ -n $need ]]; then
+  IFS=, read -ra keys <<<"$need"
+  for k in "${keys[@]}"; do
+    case $k in
+      (pid|time|mac|argv|cwd|clear|need) ;;
+      (*) reject ;;
+    esac
+  done
+fi
+
+# The owner must be this pane's program or one it started, and alive
+pane_pid=$(tmux display -p -t "$pane" '#{pane_pid}' 2>/dev/null)
+depth=0 p=$pid
+while [[ -n $p && $p != "$pane_pid" ]]; do
+  p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  depth=$(( depth + 1 ))
+  if (( depth > 64 )) || [[ -z $p || $p == 0 || $p == 1 ]]; then
+    reject
+  fi
+done
+
+record="$srv/records/${pane#%}.$pid"
+last=$(head -1 "$record" 2>/dev/null)
+if [[ -n $last ]] && (( time < last )); then
+  exit 0
+fi
+
+if [[ $seen == *" clear "* ]]; then
+  if [[ $clear != 1 || $seen == *" argv "* ]]; then
+    reject
+  fi
+  rm -f "$record"
+  exit 0
+fi
+
+if [[ $seen != *" argv "* ]]; then
+  reject
+fi
+
+IFS=, read -ra elems <<<"$argv,"
+if (( ${#elems[@]} == 0 || ${#elems[@]} > 256 )) || [[ -z ${elems[0]} ]]; then
+  reject
+fi
+
+for e in "${elems[@]}"; do
+  decode "$e" >/dev/null || reject
+done
+
+if [[ $seen == *" cwd "* ]]; then
+  [[ $(decode "$cwd") == /* ]] || reject
+fi
+
+# Line 1 the time, 2 the owner's start time, 3 its depth below the pane, 4 the cwd, then one argv element a line
+tmp=$(mktemp "$srv/records/.XXXXXX") || exit 0
+{
+  echo "$time"
+  started "$pid"
+  echo "$depth"
+  echo "$cwd"
+  printf '%s\n' "${elems[@]}"
+} >"$tmp"
+mv -f "$tmp" "$record"
