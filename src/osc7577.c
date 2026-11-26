@@ -3,7 +3,10 @@
  * hub over a Unix socket and exits. tmux keeps writing to that socket, since it tracks only the fd and never the
  * child, so a pane costs a few bytes in the hub and no process of its own
  */
+#define _GNU_SOURCE
 #include <sys/types.h>
+#include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -22,6 +25,7 @@
 #define MAXBODY 4096
 #define MAXJOBS 16
 #define PERSEC 5
+#define MAXFDS 64
 
 static const char opener[] = "\033]7577;";
 
@@ -30,15 +34,19 @@ struct pane {
 	char id[16];
 	int state;		/* bytes of the opener matched, 7 inside a body, 8 after an ESC in it */
 	size_t len;
-	char *body;		/* only while a sequence is being read */
+	char *body;		/* MAXBODY + 1 bytes, only while a sequence is being read */
 	time_t second;
 	int sent;
+	pid_t job;		/* the accept checking this pane's last report */
+	char *pending;		/* the newest report that came while it ran */
+	size_t plen;
 };
 
 static struct pollfd fds[MAXPANES + 1];
 static struct pane panes[MAXPANES + 1];
 static int npanes;
 static int jobs;
+static long fd_room;
 static const char *accept_cmd;
 
 static int
@@ -59,11 +67,18 @@ digits(const char *s)
 	return 1;
 }
 
+static int
+nonblock(int fd)
+{
+	return fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+}
+
 /* Only a body the spec would not ignore anyway: a mac of 64 hex digits last and a time inside the window */
 static int
 worth_checking(const char *b, size_t n)
 {
 	const char *t;
+	char *end;
 	long long v;
 	time_t now;
 	size_t i;
@@ -76,27 +91,24 @@ worth_checking(const char *b, size_t n)
 	for (t = b; (t = strstr(t, "time=")) != NULL; t += 5) {
 		if (t != b && t[-1] != ':')
 			continue;
-		v = strtoll(t + 5, NULL, 10);
+		v = strtoll(t + 5, &end, 10);
+		if (end == t + 5 || *end != ':')
+			return 0;
 		now = time(NULL);
-		return v >= now - 60 && v <= now + 60;
+		return v >= (long long)now - 60 && v <= (long long)now + 60;
 	}
 	return 0;
 }
 
-/* Starts accept with the body on stdin and does not wait, so a slow check never holds up pane output */
+/* Starts accept with the body on stdin and does not wait for it, so a slow check never holds up pane output */
 static void
-dispatch(struct pane *p)
+run(struct pane *p, const char *body, size_t len)
 {
 	char pane[18];
 	int in[2];
 	pid_t pid;
-	time_t now = time(NULL);
 
-	if (now != p->second) {
-		p->second = now;
-		p->sent = 0;
-	}
-	if (++p->sent > PERSEC || jobs >= MAXJOBS || pipe(in) == -1)
+	if (jobs >= MAXJOBS || fd_room < 4 || pipe(in) == -1)
 		return;
 	snprintf(pane, sizeof pane, "%%%s", p->id);
 	if ((pid = fork()) == -1) {
@@ -105,6 +117,7 @@ dispatch(struct pane *p)
 		return;
 	}
 	if (pid == 0) {
+		signal(SIGPIPE, SIG_DFL);
 		dup2(in[0], 0);
 		close(in[0]);
 		close(in[1]);
@@ -112,11 +125,63 @@ dispatch(struct pane *p)
 		_exit(127);
 	}
 	jobs++;
+	p->job = pid;
 	close(in[0]);
-	/* A pipe holds far more than MAXBODY, so this write never blocks */
-	if (write(in[1], p->body, p->len) == -1)
+	/* A pipe holds more than MAXBODY, so this write never blocks */
+	if (write(in[1], body, len) == -1)
 		fail("write");
 	close(in[1]);
+}
+
+/* One check at a time for each pane, so its reports keep their order, the newest waits for the running one */
+static void
+dispatch(struct pane *p)
+{
+	time_t now = time(NULL);
+
+	if (now != p->second) {
+		p->second = now;
+		p->sent = 0;
+	}
+	if (++p->sent > PERSEC)
+		return;
+	if (p->job == 0) {
+		run(p, p->body, p->len);
+		return;
+	}
+	if (p->pending == NULL && (p->pending = malloc(MAXBODY)) == NULL)
+		return;
+	memcpy(p->pending, p->body, p->len);
+	p->plen = p->len;
+}
+
+static void
+reap(void)
+{
+	pid_t pid;
+	int i;
+
+	while (jobs > 0 && (pid = waitpid(-1, NULL, WNOHANG)) > 0) {
+		jobs--;
+		for (i = 1; i <= npanes; i++) {
+			if (panes[i].job != pid)
+				continue;
+			panes[i].job = 0;
+			if (panes[i].pending != NULL) {
+				run(&panes[i], panes[i].pending, panes[i].plen);
+				free(panes[i].pending);
+				panes[i].pending = NULL;
+			}
+			break;
+		}
+	}
+}
+
+static void
+end_body(struct pane *p)
+{
+	free(p->body);
+	p->body = NULL;
 }
 
 static void
@@ -133,30 +198,31 @@ feed(struct pane *p, const unsigned char *buf, ssize_t n)
 			else
 				p->state = c == 033 ? 1 : 0;
 			if (p->state == 7) {
-				if (p->body == NULL && (p->body = malloc(MAXBODY)) == NULL)
+				if (p->body == NULL && (p->body = malloc(MAXBODY + 1)) == NULL)
 					p->state = 0;
 				p->len = 0;
 			}
 			continue;
 		}
 		if (p->state == 8) {
+			p->body[p->len] = '\0';
 			if (c == '\\' && worth_checking(p->body, p->len))
 				dispatch(p);
-			p->state = c == 033 ? 1 : 0;
+			/* ESC inside an OSC starts a new escape, which may be the next report */
+			p->state = c == 033 ? 1 : c == ']' ? 2 : 0;
 		} else if (c == 007) {
+			p->body[p->len] = '\0';
 			if (worth_checking(p->body, p->len))
 				dispatch(p);
 			p->state = 0;
 		} else if (c == 033)
 			p->state = 8;
 		else if (p->len == MAXBODY || c < 0x20 || c > 0x7e)
-			p->state = c == 033 ? 1 : 0;
+			p->state = 0;
 		else
 			p->body[p->len++] = c;
-		if (p->state < 7) {
-			free(p->body);
-			p->body = NULL;
-		}
+		if (p->state < 7)
+			end_body(p);
 	}
 }
 
@@ -179,22 +245,45 @@ peer_uid(int s)
 	return (uid_t)-1;
 }
 
-/* Takes one pane's fd from a pass client, which sends the pane number with it */
+/* Keeps the first fd a message carries and closes every other, a peer may send several */
+static int
+first_fd(struct msghdr *m)
+{
+	struct cmsghdr *h;
+	int fd = -1, got, k, n;
+
+	for (h = CMSG_FIRSTHDR(m); h != NULL; h = CMSG_NXTHDR(m, h)) {
+		if (h->cmsg_level != SOL_SOCKET || h->cmsg_type != SCM_RIGHTS || h->cmsg_len < CMSG_LEN(sizeof(int)))
+			continue;
+		n = (h->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+		for (k = 0; k < n; k++) {
+			memcpy(&got, (char *)CMSG_DATA(h) + k * sizeof(int), sizeof got);
+			if (fd == -1)
+				fd = got;
+			else
+				close(got);
+		}
+	}
+	return fd;
+}
+
+/* Takes one pane's fd from a pass client, which sends the pane number with it, waiting on it 100 ms at most */
 static void
-take(int listener)
+take_one(int s)
 {
 	union {
 		struct cmsghdr h;
-		char b[CMSG_SPACE(sizeof(int))];
+		char b[CMSG_SPACE(sizeof(int) * MAXFDS)];
 	} u;
+	struct pollfd w = { s, POLLIN, 0 };
 	struct msghdr m;
 	struct iovec iov;
-	struct cmsghdr *h;
 	char name[16];
-	int s, fd;
+	int fd, flags = 0;
 
-	if ((s = accept(listener, NULL, NULL)) == -1)
-		return;
+#ifdef MSG_CMSG_CLOEXEC
+	flags = MSG_CMSG_CLOEXEC;
+#endif
 	memset(&m, 0, sizeof m);
 	memset(name, 0, sizeof name);
 	iov.iov_base = name;
@@ -203,22 +292,20 @@ take(int listener)
 	m.msg_iovlen = 1;
 	m.msg_control = u.b;
 	m.msg_controllen = sizeof u.b;
-	if (peer_uid(s) != geteuid() || recvmsg(s, &m, 0) <= 0) {
-		close(s);
+	if (peer_uid(s) != geteuid() || poll(&w, 1, 100) != 1 || recvmsg(s, &m, flags) <= 0)
 		return;
-	}
-	close(s);
-	h = CMSG_FIRSTHDR(&m);
-	if (h == NULL || h->cmsg_level != SOL_SOCKET || h->cmsg_type != SCM_RIGHTS)
+	fd = first_fd(&m);
+	if (fd == -1)
 		return;
-	memcpy(&fd, CMSG_DATA(h), sizeof fd);
-	if (!digits(name) || npanes == MAXPANES) {
+	if ((m.msg_flags & MSG_CTRUNC) || !digits(name) || npanes == MAXPANES || fd_room < 8) {
+		fprintf(stderr, "osc7577: dropped pane %s\n", name);
 		close(fd);
 		return;
 	}
 	fcntl(fd, F_SETFD, FD_CLOEXEC);
-	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+	nonblock(fd);
 	npanes++;
+	fd_room--;
 	memset(&panes[npanes], 0, sizeof panes[npanes]);
 	panes[npanes].fd = fd;
 	memcpy(panes[npanes].id, name, sizeof name);
@@ -227,13 +314,44 @@ take(int listener)
 }
 
 static void
+take(int listener)
+{
+	int s;
+
+	while ((s = accept(listener, NULL, NULL)) != -1) {
+		fcntl(s, F_SETFD, FD_CLOEXEC);
+		take_one(s);
+		close(s);
+	}
+}
+
+static void
 drop(int i)
 {
 	close(panes[i].fd);
 	free(panes[i].body);
+	free(panes[i].pending);
 	panes[i] = panes[npanes];
 	fds[i] = fds[npanes];
 	npanes--;
+	fd_room++;
+}
+
+/* Room for every pane up to the hard limit, a tmux started by launchd gets a soft limit of 256 */
+static void
+raise_limit(void)
+{
+	struct rlimit r;
+
+	if (getrlimit(RLIMIT_NOFILE, &r) == 0) {
+		if (r.rlim_cur < r.rlim_max) {
+			r.rlim_cur = r.rlim_max > MAXPANES + 64 ? MAXPANES + 64 : r.rlim_max;
+			setrlimit(RLIMIT_NOFILE, &r);
+			getrlimit(RLIMIT_NOFILE, &r);
+		}
+		fd_room = (long)r.rlim_cur - 16;
+	} else
+		fd_room = 240;
 }
 
 static int
@@ -241,44 +359,45 @@ hub(const char *path, pid_t server)
 {
 	struct sockaddr_un sa;
 	unsigned char buf[16384];
-	char pidfile[sizeof sa.sun_path + 8];
+	char lockfile[sizeof sa.sun_path + 8], pidfile[sizeof sa.sun_path + 8];
 	ssize_t r;
 	FILE *f;
-	int i, s;
+	int i, lock;
 
 	memset(&sa, 0, sizeof sa);
 	sa.sun_family = AF_UNIX;
 	if (strlen(path) >= sizeof sa.sun_path)
 		return 2;
 	strcpy(sa.sun_path, path);
+	snprintf(lockfile, sizeof lockfile, "%s.lock", path);
+	snprintf(pidfile, sizeof pidfile, "%s.pid", path);
+	umask(077);
 
-	/* A hub that answers is already running for this server */
-	if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
-		return fail("socket");
-	if (connect(s, (struct sockaddr *)&sa, sizeof sa) == 0)
+	/* The lock is held for the hub's life, so only one hub binds the socket and writes the pid */
+	if ((lock = open(lockfile, O_RDWR | O_CREAT | O_CLOEXEC, 0600)) == -1)
+		return fail("open");
+	if (flock(lock, LOCK_EX | LOCK_NB) == -1)
 		return 0;
-	close(s);
 	unlink(path);
 	if ((fds[0].fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
 		return fail("socket");
-	umask(077);
 	if (bind(fds[0].fd, (struct sockaddr *)&sa, sizeof sa) == -1 || listen(fds[0].fd, 1024) == -1)
 		return fail("bind");
 	fcntl(fds[0].fd, F_SETFD, FD_CLOEXEC);
+	nonblock(fds[0].fd);
 	fds[0].events = POLLIN;
-	signal(SIGPIPE, SIG_IGN);
-	snprintf(pidfile, sizeof pidfile, "%s.pid", path);
 	if ((f = fopen(pidfile, "w")) != NULL) {
 		fprintf(f, "%ld\n", (long)getpid());
 		fclose(f);
 	}
+	signal(SIGPIPE, SIG_IGN);
+	raise_limit();
 
 	for (;;) {
-		while (jobs > 0 && waitpid(-1, NULL, WNOHANG) > 0)
-			jobs--;
+		reap();
 		if (kill(server, 0) == -1 && errno == ESRCH)
 			break;
-		if (poll(fds, npanes + 1, 2000) == -1) {
+		if (poll(fds, npanes + 1, jobs > 0 ? 100 : 2000) == -1) {
 			if (errno == EINTR)
 				continue;
 			return fail("poll");
@@ -332,6 +451,7 @@ pass(const char *path, const char *pane)
 		usleep(10000);
 	}
 	memset(&m, 0, sizeof m);
+	memset(&u, 0, sizeof u);
 	iov.iov_base = (void *)pane;
 	iov.iov_len = strlen(pane);
 	m.msg_iov = &iov;

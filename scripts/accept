@@ -42,6 +42,14 @@ if [[ ! $time =~ ^[1-9][0-9]{0,11}$ ]] || (( time < now - 60 || time > now + 60 
   exit 0
 fi
 
+# One check at a time for a pane, from the time order to the record, so two reports never interleave
+lock="$srv/times/.lock.${pane#%}"
+for _ in $(seq 100); do
+  mkdir "$lock" 2>/dev/null && break
+  sleep 0.02
+done
+trap 'rmdir "$lock" 2>/dev/null' EXIT
+
 # The last accepted time outlives clear and reject, so a recorded report cannot bring a record back
 stamp="$srv/times/${pane#%}.$pid"
 if [[ -n $pid && -f $stamp ]] && (( time < $(cat "$stamp") )); then
