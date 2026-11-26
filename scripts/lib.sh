@@ -107,13 +107,18 @@ cwd_of() {
   fi
 }
 
-# The awk that reads pane output, mawk only reacts at once in its interactive mode
+# The awk that reads pane output. mawk holds pipe input until EOF, so another awk is used when there is one
 awk_cmd() {
-  if command -v gawk >/dev/null; then
-    echo gawk
-  elif awk -W version 2>&1 | grep -q mawk; then
-    echo 'awk -W interactive'
-  else
-    echo awk
-  fi
+  local a
+  for a in awk original-awk nawk gawk busybox; do
+    if command -v "$a" >/dev/null && ! "$a" -W version 2>&1 | grep -q mawk; then
+      if [[ $a == busybox ]]; then
+        echo 'busybox awk'
+      else
+        echo "$a"
+      fi
+      return
+    fi
+  done
+  echo 'awk -W interactive'
 }

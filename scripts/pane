@@ -34,5 +34,5 @@ fi
 
 if [[ -s $file ]]; then
   # tmux expands % in this command like strftime, so the pane goes as its number
-  tmux pipe-pane -o -O -t "$pane" "exec $(awk_cmd) -v pane='${pane#%}' -v accept='$dir/accept' -f '$dir/scan.awk'"
+  tmux pipe-pane -o -O -t "$pane" "LC_ALL=C exec $(awk_cmd) -v 'RS=[\n\033\007]' -v pane='${pane#%}' -v accept='$dir/accept' -f '$dir/scan.awk'"
 fi
