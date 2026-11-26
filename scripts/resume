@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# tmux-resurrect's save and restore hooks. Save keeps the best live record of each pane, restore types a fixed
-# command into each recreated shell pane, and run then starts the recorded argv there
+# tmux-resurrect's hooks. Save keeps the best live record of each pane, restore types a fixed command into each
+# pane this restore made, and run then starts the recorded argv there
 set -u
 dir=$(cd "$(dirname "$0")" && pwd)
 source "$dir/lib.sh"
 
-# One saved set for each tmux socket, so two servers never restore each other's programs
-resume_dir() {
-  printf '%s/resume-%s' "$(state_dir)" "$(tmux display -p '#{socket_path}' | sha256 | cut -c1-12)"
-}
-
+# One file a pane, named pane.pid so accept can drop it on clear: position and uid, then the record's cwd and argv
 save() {
-  local srv out tmp n=0 pane sess widx pidx f best depth bdepth pid
+  local srv out tmp pane sess widx pidx f best depth bdepth pid
   srv=$(server_dir)
   out=$(resume_dir)
   tmp=$(mktemp -d "$(state_dir)/.resume.XXXXXX") || return 0
+  # A pane in a grouped session is listed once for each session, the first one is kept
   while IFS=$sep read -r pane sess widx pidx; do
+    if [[ -e $tmp/.seen.${pane#%} ]]; then
+      continue
+    fi
+
+    : >"$tmp/.seen.${pane#%}"
     best='' bdepth=''
     for f in "$srv/records/${pane#%}".*; do
       if [[ ! -f $f ]]; then
@@ -36,11 +38,11 @@ save() {
     done
 
     if [[ -n $best ]]; then
-      n=$(( n + 1 ))
-      { printf '%s\n' "$sess$sep$widx$sep$pidx"; tail -n +4 "$best"; } >"$tmp/$n"
+      { printf '%s\n' "$sess$sep$widx$sep$pidx$sep$EUID"; tail -n +4 "$best"; } >"$tmp/${best##*/}"
     fi
   done < <(tmux list-panes -a -F "#{pane_id}$sep#{session_name}$sep#{window_index}$sep#{pane_index}")
 
+  rm -f "$tmp"/.seen.*
   rm -rf "$out.old"
   if [[ -d $out ]]; then
     mv "$out" "$out.old"
@@ -50,16 +52,14 @@ save() {
   prune "$srv"
 }
 
-# Tokens and records of closed panes, and the folders of servers that are gone
+# Tokens, times and records of closed panes, and the folders of servers that are gone
 prune() {
-  local srv=$1 live f d pid
+  local srv=$1 live f b d pid
   live=" $(tmux list-panes -a -F '#{pane_id}' | tr -d '%' | tr '\n' ' ') "
-  for f in "$srv"/tokens/* "$srv"/records/*; do
-    if [[ -f $f ]]; then
-      f=${f##*/}
-      if [[ $live != *" ${f%%.*} "* ]]; then
-        rm -f "$srv/tokens/$f" "$srv/records/$f"
-      fi
+  for f in "$srv"/tokens/[0-9]* "$srv"/records/[0-9]* "$srv"/times/[0-9]*; do
+    b=${f##*/}
+    if [[ -f $f && $live != *" ${b%%.*} "* ]]; then
+      rm -f "$f"
     fi
   done
 
@@ -72,42 +72,88 @@ prune() {
   done
 }
 
+# The panes that exist before resurrect restores, which restore leaves alone
+before() {
+  tmux list-panes -a -F '#{pane_id}' >"$(server_dir)/before-restore"
+}
+
+# Whether tmux-resurrect starts a program in this pane itself, by its own rules
+resurrect_restores() {
+  local rdir last cmd
+  rdir="$(tmux show-environment -g TMUX_PLUGIN_MANAGER_PATH 2>/dev/null | sed -n 's/^[^=]*=//p')"
+  rdir="${rdir:-$HOME/.tmux/plugins/}tmux-resurrect/scripts"
+  last="$(option @resurrect-dir "${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect")/last"
+  last=${last/#\~/$HOME}
+  if [[ ! -f $rdir/process_restore_helpers.sh || ! -f $last ]]; then
+    return 1
+  fi
+
+  cmd=$(awk -F '\t' -v s="$1" -v w="$2" -v p="$3" '$1 == "pane" && $2 == s && $3 == w && $6 == p { print substr($11, 2); exit }' "$last")
+  if [[ -z $cmd ]]; then
+    return 1
+  fi
+
+  (
+    # shellcheck disable=SC1091
+    source "$rdir/variables.sh" && source "$rdir/helpers.sh" && source "$rdir/process_restore_helpers.sh" \
+      && { _restore_all_processes || _process_on_the_restore_list "$cmd"; }
+  ) >/dev/null 2>&1
+}
+
 restore() {
-  local src run allow shells f sess widx pidx pane argv0 n=0
+  local src run allow shells f sess widx pidx uid pane id ppid tpgid argv0 n=0 old
   src=$(resume_dir)
   if [[ ! -d $src || $dir == *\'* ]]; then
     return 0
   fi
 
+  if (( EUID == 0 )) && [[ $(option @osc7577-root off) != on ]]; then
+    return 0
+  fi
+
+  old=" $(tr '\n' ' ' <"$(server_dir)/before-restore" 2>/dev/null) "
   run="$(state_dir)/run"
   (umask 077 && mkdir -p "$run")
   allow=" $(option @osc7577-allow '') "
-  shells=" $(option @osc7577-shells 'zsh bash fish sh dash ksh tcsh nu') "
+  shells=" $(option @osc7577-shells 'zsh bash fish sh dash ksh tcsh') "
   for f in "$src"/*; do
     if [[ ! -f $f ]]; then
       continue
     fi
 
-    IFS=$sep read -r sess widx pidx <"$f"
+    # An entry is tried once: a resume that fails, or crashes tmux, does not run again on the next start
+    mv "$f" "$f.tried" 2>/dev/null || continue
+    f="$f.tried"
+    IFS=$sep read -r sess widx pidx uid <"$f"
     pane="=$sess:$widx.$pidx"
-    if [[ $shells != *" $(tmux display -p -t "$pane" '#{pane_current_command}' 2>/dev/null) "* ]]; then
+    IFS=$sep read -r id ppid < <(tmux display -p -t "$pane" "#{pane_id}$sep#{pane_pid}" 2>/dev/null)
+    if [[ -z $id || $old == *" $id "* || $uid != "$EUID" ]]; then
+      continue
+    fi
+
+    # The pane's own shell, run by this user, in the foreground with no job, where resurrect starts nothing
+    tpgid=$(ps -o tpgid= -p "$ppid" 2>/dev/null | tr -d ' ')
+    if [[ $shells != *" $(tmux display -p -t "$id" '#{pane_current_command}') "* || $tpgid != "$ppid" ]] \
+      || [[ $(ps -o uid= -p "$ppid" | tr -d ' ') != "$EUID" ]] || resurrect_restores "$sess" "$widx" "$pidx"; then
       continue
     fi
 
     argv0=$(decode "$(sed -n 3p "$f")") || continue
-    if [[ $allow != '  ' && $allow != *" ${argv0##*/} "* ]]; then
+    if [[ $allow != '  ' && $allow != *" $argv0 "* ]]; then
       continue
     fi
 
     n=$(( n + 1 ))
     tail -n +2 "$f" >"$run/$n"
     # The leading space keeps it out of the history of a shell that skips such lines
-    tmux send-keys -t "$pane" -l " '$dir/run' '$run/$n'" \; send-keys -t "$pane" Enter
+    tmux send-keys -t "$id" -l " '$dir/run' '$run/$n'" \; send-keys -t "$id" Enter
   done
+  rm -f "$src"/*.tried
 }
 
 case ${1:-} in
   (save) save ;;
+  (before) before ;;
   (restore) restore ;;
-  (*) echo "usage: resume save|restore" >&2; exit 2 ;;
+  (*) echo "usage: resume save|before|restore" >&2; exit 2 ;;
 esac

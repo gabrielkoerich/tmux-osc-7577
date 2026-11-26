@@ -1,31 +1,37 @@
 #!/usr/bin/env bash
-# TPM entry: a token for every new pane, a listener for every session, and restore through tmux-resurrect
+# TPM entry: a token and a reader for every new pane, and restore through tmux-resurrect
 dir=$(cd "$(dirname "$0")" && pwd)
 source "$dir/scripts/lib.sh"
 
+# Never pass on a token tmux got from the terminal it runs in, also when the plugin is off
+tmux set-environment -gu OSC7577_TOKEN
 if [[ $(option @osc7577 on) != on || $dir == *\'* ]]; then
+  for hook in after-new-session after-new-window after-split-window; do
+    tmux set-hook -gu "${hook}[7577]"
+  done
   exit 0
 fi
 
-"$dir/scripts/token" seed
+set_token "$(new_token)"
 
 # A fixed index replaces the hook on a reload instead of adding it twice
-assign="run-shell \"'$dir/scripts/token' assign '#{pane_id}'\""
 for hook in after-new-session after-new-window after-split-window; do
-  tmux set-hook -g "${hook}[7577]" "$assign"
-done
-tmux set-hook -g 'session-created[7577]' "run-shell -b \"'$dir/scripts/listen' '#{session_id}'\""
-
-for sid in $(tmux list-sessions -F '#{session_id}'); do
-  tmux run-shell -b "'$dir/scripts/listen' '$sid'"
+  tmux set-hook -g "${hook}[7577]" "run-shell \"'$dir/scripts/pane' '#{pane_id}'\""
 done
 
-# resurrect runs each hook with eval, so ours goes after one already there, once
-for kind in save:post-save-all restore:post-restore-all; do
+# After a reload, panes that already have a token get their reader back, the rest never had one
+for pane in $(tmux list-panes -a -F '#{pane_id}'); do
+  if [[ -s "$(server_dir)/tokens/${pane#%}" ]]; then
+    "$dir/scripts/pane" "$pane"
+  fi
+done
+
+# resurrect runs each hook with eval, so ours goes on its own line after one already there, once
+for kind in save:post-save-all before:pre-restore-all restore:post-restore-all; do
   name="@resurrect-hook-${kind#*:}"
   cmd="'$dir/scripts/resume' ${kind%%:*}"
   cur=$(tmux show -gqv "$name")
   if [[ $cur != *"$cmd"* ]]; then
-    tmux set -g "$name" "${cur:+$cur; }$cmd"
+    tmux set -g "$name" "${cur:+$cur$'\n'}$cmd"
   fi
 done

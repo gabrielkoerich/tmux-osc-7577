@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Starts a restored command in the pane's shell, with each argv element as one argument and no shell parsing
+# Starts a restored command in the pane's shell, each argv element one argument, with no shell parsing. The new
+# process takes over the record until it reports, clears or exits, as the spec says
 set -u
 source "$(dirname "$0")/lib.sh"
 
@@ -9,14 +10,28 @@ if [[ ! -f $f ]]; then
 fi
 
 cwd=$(sed -n 1p "$f")
-argv=()
+elems=()
 while IFS= read -r e; do
-  v=$(decode "$e") || exit 1
-  argv+=("$v")
+  elems+=("$e")
 done < <(tail -n +2 "$f")
 rm -f "$f"
 
-if [[ -n $cwd ]]; then
-  cd "$(decode "$cwd")" 2>/dev/null || true
+argv=()
+for e in "${elems[@]}"; do
+  v=$(decode "$e") || exit 1
+  argv+=("$v")
+done
+command_ok "${argv[0]}" || exit 1
+
+# A folder the program asked for must still exist, the owner's own folder is only a preference
+if [[ $cwd == \?* ]]; then
+  cd "$(decode "${cwd#\?}")" 2>/dev/null || true
+elif [[ -n $cwd ]]; then
+  cd "$(decode "$cwd")" 2>/dev/null || exit 1
 fi
-exec "${argv[@]}"
+
+if [[ -n ${TMUX_PANE:-} ]]; then
+  srv=$(server_dir)
+  { date +%s; started $$; echo 1; echo "$cwd"; printf '%s\n' "${elems[@]}"; } >"$srv/records/${TMUX_PANE#%}.$$"
+fi
+exec -- "${argv[@]}"

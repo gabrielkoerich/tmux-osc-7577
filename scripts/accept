@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Checks one OSC 7577 report from a pane the way the spec orders it, and keeps or clears that program's record
+# Checks one OSC 7577 report from a pane, body on stdin, the way the spec orders it, and keeps or clears that
+# program's record
 set -u
 source "$(dirname "$0")/lib.sh"
 
-pane=$1 body=$2
-if [[ ! $pane =~ ^%[0-9]+$ || $body == '?' ]]; then
+pane=${1:-}
+body=$(head -c 4097)
+if [[ ! $pane =~ ^%[0-9]+$ || $body == '?' || ${#body} -gt 4096 ]]; then
   exit 0
 fi
 
@@ -24,13 +26,13 @@ if [[ $(printf '%s:%s' "$signed" "$token" | sha256) != "$mac" ]]; then
   exit 0
 fi
 
-# The time check also comes before any rule that could clear a record
+# The time checks come before any rule that could clear a record: the window, then the order for this pid
 IFS=: read -ra pairs <<<"$signed"
 time='' pid=''
 for p in "${pairs[@]}"; do
-  if [[ $p == time=* ]]; then
+  if [[ $p == time=* && -z $time ]]; then
     time=${p#time=}
-  elif [[ $p =~ ^pid=([1-9][0-9]{0,9})$ ]]; then
+  elif [[ $p =~ ^pid=([1-9][0-9]{0,9})$ && -z $pid ]]; then
     pid=${BASH_REMATCH[1]}
   fi
 done
@@ -40,15 +42,21 @@ if [[ ! $time =~ ^[1-9][0-9]{0,11}$ ]] || (( time < now - 60 || time > now + 60 
   exit 0
 fi
 
+# The last accepted time outlives clear and reject, so a recorded report cannot bring a record back
+stamp="$srv/times/${pane#%}.$pid"
+if [[ -n $pid && -f $stamp ]] && (( time < $(cat "$stamp") )); then
+  exit 0
+fi
+
+record="$srv/records/${pane#%}.$pid"
 # From here the report is genuine, so a broken rule means the program's command changed and its record goes
 reject() {
   if [[ -n $pid ]]; then
-    rm -f "$srv/records/${pane#%}.$pid"
+    rm -f "$record" "$(resume_dir)/${pane#%}.$pid"
   fi
   exit 0
 }
 
-# read drops an empty last field, so an empty pair is caught here
 if [[ $signed == :* || $signed == *: || $signed == *::* ]]; then
   reject
 fi
@@ -82,7 +90,11 @@ if [[ -z $pid || $seen != *" time "* ]]; then
   reject
 fi
 
-if [[ -n $need ]]; then
+if [[ $seen == *" need "* ]]; then
+  if [[ ! $need =~ ^[a-z]+(,[a-z]+)*$ ]]; then
+    reject
+  fi
+
   IFS=, read -ra keys <<<"$need"
   for k in "${keys[@]}"; do
     case $k in
@@ -92,8 +104,12 @@ if [[ -n $need ]]; then
   done
 fi
 
-# The owner must be this pane's program or one it started, and alive
+# The owner must be this pane's program or one it started, alive, and run by this user
 pane_pid=$(tmux display -p -t "$pane" '#{pane_pid}' 2>/dev/null)
+if [[ $(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ') != "$EUID" ]]; then
+  reject
+fi
+
 depth=0 p=$pid
 while [[ -n $p && $p != "$pane_pid" ]]; do
   p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
@@ -103,17 +119,12 @@ while [[ -n $p && $p != "$pane_pid" ]]; do
   fi
 done
 
-record="$srv/records/${pane#%}.$pid"
-last=$(head -1 "$record" 2>/dev/null)
-if [[ -n $last ]] && (( time < last )); then
-  exit 0
-fi
-
 if [[ $seen == *" clear "* ]]; then
   if [[ $clear != 1 || $seen == *" argv "* ]]; then
     reject
   fi
-  rm -f "$record"
+  printf '%s' "$time" >"$stamp"
+  rm -f "$record" "$(resume_dir)/${pane#%}.$pid"
   exit 0
 fi
 
@@ -122,7 +133,7 @@ if [[ $seen != *" argv "* ]]; then
 fi
 
 IFS=, read -ra elems <<<"$argv,"
-if (( ${#elems[@]} == 0 || ${#elems[@]} > 256 )) || [[ -z ${elems[0]} ]]; then
+if (( ${#elems[@]} == 0 || ${#elems[@]} > 256 )); then
   reject
 fi
 
@@ -130,8 +141,13 @@ for e in "${elems[@]}"; do
   decode "$e" >/dev/null || reject
 done
 
+command_ok "$(decode "${elems[0]}")" || reject
+
+# A cwd from the report must be absolute. Without one the owner's own folder is used, marked with a leading ?
 if [[ $seen == *" cwd "* ]]; then
   [[ $(decode "$cwd") == /* ]] || reject
+else
+  cwd="?$(cwd_of "$pid" | base64 | tr -d '\n')"
 fi
 
 # Line 1 the time, 2 the owner's start time, 3 its depth below the pane, 4 the cwd, then one argv element a line
@@ -144,3 +160,4 @@ tmp=$(mktemp "$srv/records/.XXXXXX") || exit 0
   printf '%s\n' "${elems[@]}"
 } >"$tmp"
 mv -f "$tmp" "$record"
+printf '%s' "$time" >"$stamp"

@@ -19,28 +19,44 @@ if [[ -z ${OSC7577_TOKEN:-} ]]; then
   exit 0
 fi
 
-body="pid=$pid:time=$(date +%s)"
+send() {
+  local body mac out=/dev/tty
+  body="pid=$pid:time=$(date +%s)$1"
+  mac=$(printf '%s:%s' "$body" "$OSC7577_TOKEN" | sha256)
+  if ! { : >/dev/tty; } 2>/dev/null; then
+    out=/dev/stdout
+  fi
+  printf '\033]7577;%s:mac=%s\033\134' "$body" "$mac" >"$out"
+}
+
 if [[ -n $clear ]]; then
-  body+=":clear=1"
-else
-  if (( $# == 0 )); then
-    echo "usage: report [-p pid] [-C dir] -- argv... | report [-p pid] --clear" >&2
+  send ":clear=1"
+  exit 0
+fi
+
+usage="usage: report [-p pid] [-C dir] -- argv... | report [-p pid] --clear"
+if (( $# == 0 )) || ! command_ok "$1"; then
+  echo "$usage, the command an absolute path or a bare name" >&2
+  exit 2
+fi
+
+argv=''
+for a in "$@"; do
+  if [[ $a == *[[:cntrl:]]* ]]; then
+    echo "report: an argument has a control character, a terminal would reject it" >&2
     exit 2
   fi
+  argv+="${argv:+,}$(printf '%s' "$a" | base64 | tr -d '\n')"
+done
 
-  argv=
-  for a in "$@"; do
-    argv+="${argv:+,}$(printf '%s' "$a" | base64 | tr -d '\n')"
-  done
-  body+=":argv=$argv"
-  if [[ -n $cwd ]]; then
-    body+=":cwd=$(printf '%s' "$cwd" | base64 | tr -d '\n')"
-  fi
+extra=":argv=$argv"
+if [[ -n $cwd ]]; then
+  cwd=$(cd "$cwd" 2>/dev/null && pwd) || { echo "report: no such folder" >&2; exit 2; }
+  extra+=":cwd=$(printf '%s' "$cwd" | base64 | tr -d '\n')"
 fi
 
-mac=$(printf '%s:%s' "$body" "$OSC7577_TOKEN" | sha256)
-out=/dev/tty
-if ! { : >/dev/tty; } 2>/dev/null; then
-  out=/dev/stdout
+# A terminal may keep an older, smaller command when this one is past the 2048 byte minimum, so clear it first
+if (( ${#extra} + 120 > 2048 )); then
+  send ":clear=1"
 fi
-printf '\033]7577;%s:mac=%s\033\134' "$body" "$mac" >"$out"
+send "$extra"

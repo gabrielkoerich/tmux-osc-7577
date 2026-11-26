@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Runs after tmux creates a pane: notes the token tmux copied into it from the global environment, sets a fresh
+# one for the next pane, and starts the pane's reader. tmux has no hook for respawn-pane, so those keep the old
+set -u
+dir=$(cd "$(dirname "$0")" && pwd)
+source "$dir/lib.sh"
+
+pane=${1:-}
+if [[ ! $pane =~ ^%[0-9]+$ || $dir == *\'* ]]; then
+  exit 2
+fi
+
+srv=$(server_dir)
+file="$srv/tokens/${pane#%}"
+# A pane that has a token is not new, as when a grouped session reuses it, so only its reader is checked
+if [[ ! -e $file ]]; then
+  lock="$srv/tokens/.lock"
+  for _ in $(seq 50); do
+    mkdir "$lock" 2>/dev/null && break
+    sleep 0.02
+  done
+
+  tok=$(tmux show-environment -g OSC7577_TOKEN 2>/dev/null | sed -n 's/^OSC7577_TOKEN=//p')
+  # Panes made at the same moment can start with the same token, then neither may use it
+  if [[ -n $tok ]] && grep -qxF -- "$tok" "$srv/tokens/.used" 2>/dev/null; then
+    grep -lxF -- "$tok" "$srv"/tokens/[0-9]* 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
+    : >"$file"
+  elif [[ $tok =~ ^[A-Za-z0-9_-]{22,64}$ ]]; then
+    (umask 077 && printf '%s\n' "$tok" >>"$srv/tokens/.used" && printf '%s' "$tok" >"$file")
+  fi
+  set_token "$(new_token)"
+  rmdir "$lock" 2>/dev/null
+fi
+
+if [[ -s $file ]]; then
+  # tmux expands % in this command like strftime, so the pane goes as its number
+  tmux pipe-pane -o -O -t "$pane" "exec $(awk_cmd) -v pane='${pane#%}' -v accept='$dir/accept' -f '$dir/scan.awk'"
+fi

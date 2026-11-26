@@ -14,8 +14,13 @@ state_dir() {
 server_dir() {
   local d
   d="$(state_dir)/server-$(tmux display -p '#{pid}-#{start_time}')"
-  (umask 077 && mkdir -p "$d/tokens" "$d/records" "$d/listeners")
+  (umask 077 && mkdir -p "$d/tokens" "$d/records" "$d/times")
   printf '%s' "$d"
+}
+
+# One saved set for each tmux socket, so two servers never restore each other's programs
+resume_dir() {
+  printf '%s/resume-%s' "$(state_dir)" "$(tmux display -p '#{socket_path}' | sha256 | cut -c1-12)"
 }
 
 option() {
@@ -29,6 +34,15 @@ new_token() {
   head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43
 }
 
+# Sets the token for the next pane through a private file, so it never shows on a command line
+set_token() {
+  local f
+  f=$(mktemp "$(state_dir)/.env.XXXXXX") || return 1
+  printf 'set-environment -g OSC7577_TOKEN %s\n' "$1" >"$f"
+  tmux source-file "$f"
+  rm -f "$f"
+}
+
 sha256() {
   if command -v sha256sum >/dev/null; then
     sha256sum | cut -d' ' -f1
@@ -37,9 +51,18 @@ sha256() {
   fi
 }
 
+# Strict UTF-8, since macOS iconv passes code points past U+10FFFF
+utf8_ok() {
+  if command -v perl >/dev/null; then
+    perl -MEncode -0777 -ne 'decode("UTF-8", $_, Encode::FB_CROAK); END { exit 0 }' <"$1" 2>/dev/null
+  else
+    iconv -f UTF-8 -t UTF-8 <"$1" >/dev/null 2>&1
+  fi
+}
+
 # Decodes one base64 element to stdout, or fails when it is not base64 or not text without control characters
 decode() {
-  local s=$1 tmp n
+  local s=$1 tmp size
   if [[ ! $s =~ $b64_re ]]; then
     return 1
   fi
@@ -48,15 +71,15 @@ decode() {
     s+='='
   done
   tmp=$(mktemp) || return 1
-  if ! printf '%s' "$s" | base64 -d >"$tmp" 2>/dev/null \
-    || ! iconv -f UTF-8 -t UTF-8 <"$tmp" >/dev/null 2>&1 \
-    || LC_ALL=C grep -q $'[\x01-\x1f\x7f]\|\xc2[\x80-\x9f]' "$tmp"; then
+  # tr drops every C0 control and DEL, a size change means there was one, grep finds C1 in its UTF-8 form
+  if ! printf '%s' "$s" | base64 -d >"$tmp" 2>/dev/null || ! utf8_ok "$tmp" \
+    || LC_ALL=C grep -q $'\xc2[\x80-\x9f]' "$tmp"; then
     rm -f "$tmp"
     return 1
   fi
 
-  n=$(LC_ALL=C tr -d '\000' <"$tmp" | wc -c)
-  if (( n != $(wc -c <"$tmp") )); then
+  size=$(wc -c <"$tmp")
+  if (( $(LC_ALL=C tr -d '\000-\037\177' <"$tmp" | wc -c) != size )); then
     rm -f "$tmp"
     return 1
   fi
@@ -65,7 +88,32 @@ decode() {
   rm -f "$tmp"
 }
 
+# A command is an absolute path or a bare name, and a bare name never starts with -
+command_ok() {
+  [[ $1 == /* || ( $1 != */* && $1 != -* && -n $1 ) ]]
+}
+
 # The start time of a pid, so a pid the system gave to a new process does not pass for the old one
 started() {
   LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | tr -s ' '
+}
+
+# The working directory of a process, read from the system
+cwd_of() {
+  if [[ -d /proc/$1 ]]; then
+    readlink "/proc/$1/cwd" 2>/dev/null
+  else
+    lsof -a -d cwd -p "$1" -Fn 2>/dev/null | sed -n 's/^n//p'
+  fi
+}
+
+# The awk that reads pane output, mawk only reacts at once in its interactive mode
+awk_cmd() {
+  if command -v gawk >/dev/null; then
+    echo gawk
+  elif awk -W version 2>&1 | grep -q mawk; then
+    echo 'awk -W interactive'
+  else
+    echo awk
+  fi
 }

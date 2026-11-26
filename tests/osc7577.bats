@@ -4,7 +4,8 @@
 setup() {
   root="$BATS_TEST_DIRNAME/.."
   sock="$BATS_TEST_TMPDIR/t.sock"
-  export XDG_STATE_HOME="$BATS_TEST_TMPDIR/state"
+  export XDG_STATE_HOME="$BATS_TEST_TMPDIR/state" XDG_DATA_HOME="$BATS_TEST_TMPDIR/data"
+  unset TMUX_PLUGIN_MANAGER_PATH
   mkdir -p "$BATS_TEST_TMPDIR/bin" "$BATS_TEST_TMPDIR/out"
   # The scripts call plain tmux, this sends them to the private socket
   printf '#!/bin/sh\nexec %s -S %s "$@"\n' "$(command -v tmux)" "$sock" >"$BATS_TEST_TMPDIR/bin/tmux"
@@ -31,7 +32,6 @@ start() {
   tmux_real -S "$sock" -f /dev/null new -d -s main -x 120 -y 40 "bash --norc --noprofile"
   tmux_real -S "$sock" set -g @resurrect-hook-post-save-all ''
   "$root/osc-7577.tmux"
-  wait_for listener
 }
 
 # Waits up to 5 seconds for a condition
@@ -39,7 +39,7 @@ wait_for() {
   local i
   for i in $(seq 50); do
     case $1 in
-      (listener) ls "$XDG_STATE_HOME"/tmux-osc-7577/server-*/listeners/*/pid >/dev/null 2>&1 && return 0 ;;
+      (pipe) [ "$(tmux_real -S "$sock" display -p -t "$2" '#{pane_pipe}')" = 1 ] && return 0 ;;
       (record) ls "$XDG_STATE_HOME"/tmux-osc-7577/server-*/records/"$2".* >/dev/null 2>&1 && return 0 ;;
       (file) [ -s "$2" ] && return 0 ;;
     esac
@@ -48,9 +48,17 @@ wait_for() {
   return 1
 }
 
-# A new shell pane, its id on stdout
+# A new shell pane with its reader running, its id on stdout
 pane() {
-  tmux_real -S "$sock" new-window -d -P -F '#{pane_id}' -t main "bash --norc --noprofile"
+  local p
+  p=$(tmux_real -S "$sock" new-window -d -P -F '#{pane_id}' -t main "bash --norc --noprofile")
+  wait_for pipe "$p"
+  echo "$p"
+}
+
+# Prints a report signed with the pane's token, from inside the pane, with any body
+signed() {
+  type_in "$1" "b=\"$2\"; m=\$(printf '%s:%s' \"\$b\" \"\$OSC7577_TOKEN\" | shasum -a 256 | cut -d' ' -f1); printf '\\033]7577;%s:mac=%s\\033\\\\' \"\$b\" \"\$m\""
 }
 
 # Types a line into a pane
@@ -88,8 +96,7 @@ records() {
   p=$(pane)
   type_in "$p" "OSC7577_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxx '$root/scripts/report' -- probe"
   type_in "$p" "printf '%s' '\\033]7577;pid=1:time=1:argv=cHJvYmU=:mac=0000000000000000000000000000000000000000000000000000000000000000\\033\\\\'"
-  body="pid=\$\$:time=\$(( \$(date +%s) - 300 )):argv=cHJvYmU="
-  type_in "$p" "b=\"$body\"; m=\$(printf '%s:%s' \"\$b\" \"\$OSC7577_TOKEN\" | shasum -a 256 | cut -d' ' -f1); printf '\\033]7577;%s:mac=%s\\033\\\\' \"\$b\" \"\$m\""
+  signed "$p" "pid=\$\$:time=\$(( \$(date +%s) - 300 )):argv=cHJvYmU="
   sleep 1.5
   [ "$(records "$p")" -eq 0 ]
 }
@@ -98,8 +105,7 @@ records() {
   p=$(pane)
   type_in "$p" "'$root/scripts/report' -- probe"
   wait_for record "${p#%}"
-  body="pid=\$\$:time=\$(date +%s):argv=cHJvYmU=:argv=cHJvYmU="
-  type_in "$p" "b=\"$body\"; m=\$(printf '%s:%s' \"\$b\" \"\$OSC7577_TOKEN\" | shasum -a 256 | cut -d' ' -f1); printf '\\033]7577;%s:mac=%s\\033\\\\' \"\$b\" \"\$m\""
+  signed "$p" "pid=\$\$:time=\$(date +%s):argv=cHJvYmU=:argv=cHJvYmU="
   sleep 1.5
   [ "$(records "$p")" -eq 0 ]
 }
@@ -121,10 +127,10 @@ records() {
   sleep 0.3
 
   start
+  "$root/scripts/resume" before
   for i in $(seq "$idx"); do
     tmux_real -S "$sock" new-window -d -t main "bash --norc --noprofile"
   done
-  sleep 0.5
   "$root/scripts/resume" restore
   wait_for file "$BATS_TEST_TMPDIR/out/args"
   sleep 0.3
@@ -135,4 +141,61 @@ records() {
   [ "${lines[3]}" = ";ls" ]
   [ "${#lines[@]}" -eq 4 ]
   [ ! -e "$BATS_TEST_TMPDIR/pwned" ]
+}
+
+@test "a relative command, a command starting with -, or a newline in an argument is rejected" {
+  p=$(pane)
+  signed "$p" "pid=\$\$:time=\$(date +%s):argv=Li9ydW4uc2g="
+  signed "$p" "pid=\$\$:time=\$(date +%s):argv=LWE=,eA==,L2Jpbi9zaA=="
+  signed "$p" "pid=\$\$:time=\$(date +%s):argv=cHJvYmU=,YQpi"
+  sleep 1.5
+  [ "$(records "$p")" -eq 0 ]
+}
+
+@test "a report sent again after a clear does not bring the record back" {
+  p=$(pane)
+  type_in "$p" "t=\$(date +%s); b=\"pid=\$\$:time=\$t:argv=cHJvYmU=\"; m=\$(printf '%s:%s' \"\$b\" \"\$OSC7577_TOKEN\" | shasum -a 256 | cut -d' ' -f1); printf '\\033]7577;%s:mac=%s\\033\\\\' \"\$b\" \"\$m\" | tee $BATS_TEST_TMPDIR/out/old"
+  wait_for record "${p#%}"
+  sleep 1.1
+  type_in "$p" "'$root/scripts/report' --clear"
+  sleep 1
+  [ "$(records "$p")" -eq 0 ]
+  type_in "$p" "cat $BATS_TEST_TMPDIR/out/old"
+  sleep 1.5
+  [ "$(records "$p")" -eq 0 ]
+}
+
+@test "a grouped session leaves the token of the pane it shares alone" {
+  p=$(pane)
+  before=$(cat "$XDG_STATE_HOME"/tmux-osc-7577/server-*/tokens/"${p#%}")
+  tmux_real -S "$sock" new-session -d -t main -s view
+  sleep 0.5
+  [ "$(cat "$XDG_STATE_HOME"/tmux-osc-7577/server-*/tokens/"${p#%}")" = "$before" ]
+  [ "$(cat "$XDG_STATE_HOME"/tmux-osc-7577/server-*/tokens/0)" != "$(cat "$XDG_STATE_HOME"/tmux-osc-7577/server-*/tokens/"${p#%}")" ]
+}
+
+@test "restore leaves panes that existed before it, and panes with a job in front of the shell" {
+  p=$(pane)
+  q=$(pane)
+  type_in "$p" "'$root/scripts/report' -- probe"
+  type_in "$q" "'$root/scripts/report' -- probe"
+  wait_for record "${p#%}"
+  wait_for record "${q#%}"
+  "$root/scripts/resume" save
+  "$root/scripts/resume" before
+  "$root/scripts/resume" restore
+  sleep 1
+  [ ! -e "$BATS_TEST_TMPDIR/out/args" ]
+}
+
+@test "a flood of fake reports printed as text calls accept for none of them" {
+  p=$(pane)
+  now=$(date +%s)
+  for i in $(seq 2000); do
+    printf '\033]7577;pid=1:time=1:argv=eA==:mac=%064d\033\\' 0
+  done >"$BATS_TEST_TMPDIR/out/flood"
+  start=$(date +%s)
+  type_in "$p" "cat $BATS_TEST_TMPDIR/out/flood; echo done >$BATS_TEST_TMPDIR/out/flooded"
+  wait_for file "$BATS_TEST_TMPDIR/out/flooded"
+  [ $(( $(date +%s) - start )) -lt 4 ]
 }
