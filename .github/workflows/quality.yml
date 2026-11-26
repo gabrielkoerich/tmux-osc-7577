@@ -1,0 +1,76 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Ubuntu's awk is mawk, which holds pipe input until EOF, so the awk reader runs on gawk
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -o Acquire::Retries=5 bats tmux gawk shellcheck
+
+      - name: Shell checks
+        run: |
+          for f in osc-7577.tmux scripts/*; do
+            case $f in
+              (*.awk) ;;
+              (*) bash -n "$f" ;;
+            esac
+          done
+          shellcheck -x -e SC1091,SC2154 osc-7577.tmux scripts/accept scripts/pane scripts/resume scripts/run scripts/report scripts/lib.sh
+
+      - name: Build the hub with every warning an error
+        run: cc -O2 -Wall -Wextra -Werror -o /tmp/osc7577 src/osc7577.c
+
+      - name: Fuzz the parser under ASan and UBSan
+        run: |
+          cc -g -fsanitize=address,undefined -fno-sanitize-recover=all -o /tmp/fuzz tests/fuzz.c
+          for seed in 1 2 3; do
+            /tmp/fuzz "$seed" 50000
+          done
+
+      - name: Tests with the hub
+        run: bats tests
+
+      - name: Tests with the awk reader
+        run: READER=awk bats tests
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bats + tmux
+        run: brew install bats-core tmux
+
+      # tmux on macOS runs the scripts with the system bash 3.2 and the system awk
+      - name: Tests with the system bash and awk
+        run: |
+          mkdir -p /tmp/tools
+          ln -sf "$(command -v tmux)" /tmp/tools/tmux
+          ln -sf "$(readlink -f "$(command -v bats)")" /tmp/tools/bats
+          PATH="/bin:/usr/bin:/usr/sbin:/tmp/tools" bats tests
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
